@@ -1,0 +1,219 @@
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/dspark/model-dspark-00001.safetensors
+  dir=/data/MiniMax-M3.1-Flash/dspark
+  out=model-dspark-00001.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00001-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00001-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00002-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00002-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00005-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00005-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00006-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00006-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00007-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00007-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00008-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00008-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00009-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00009-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00010-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00010-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00011-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00011-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00012-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00012-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00013-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00013-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00014-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00014-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00015-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00015-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00016-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00016-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00017-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00017-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00018-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00018-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00019-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00019-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00020-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00020-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00021-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00021-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00022-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00022-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00023-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00023-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00024-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00024-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00025-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00025-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00026-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00026-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00027-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00027-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00028-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00028-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00029-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00029-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00030-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00030-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00031-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00031-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00032-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00032-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00033-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00033-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00034-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00034-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00035-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00035-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00036-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00036-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00037-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00037-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00038-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00038-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00039-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00039-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00040-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00040-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00041-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00041-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00042-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00042-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00043-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00043-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00044-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00044-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00045-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00045-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00046-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00046-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00047-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00047-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model-00048-of-00048.safetensors
+  dir=/data/MiniMax-M3.1-Flash
+  out=model-00048-of-00048.safetensors
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/model.safetensors.index.json
+  dir=/data/MiniMax-M3.1-Flash
+  out=model.safetensors.index.json
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/preprocessor_config.json
+  dir=/data/MiniMax-M3.1-Flash
+  out=preprocessor_config.json
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/processing_minimax.py
+  dir=/data/MiniMax-M3.1-Flash
+  out=processing_minimax.py
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/special_tokens_map.json
+  dir=/data/MiniMax-M3.1-Flash
+  out=special_tokens_map.json
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/tokenizer.json
+  dir=/data/MiniMax-M3.1-Flash
+  out=tokenizer.json
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/tokenizer_config.json
+  dir=/data/MiniMax-M3.1-Flash
+  out=tokenizer_config.json
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/video_processor.py
+  dir=/data/MiniMax-M3.1-Flash
+  out=video_processor.py
+
+https://www.modelscope.cn/models/MiniMax/MiniMax-M3.1-Flash/resolve/master/vocab.json
+  dir=/data/MiniMax-M3.1-Flash
+  out=vocab.json

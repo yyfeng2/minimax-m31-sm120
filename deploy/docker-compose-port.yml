@@ -1,0 +1,57 @@
+# MiniMax-M3.1-Flash 推理服务（RTX PRO 6000 ×4 / SM120）
+# m31-sm120-port 移植分支 v1：fp8 KV + Triton 稀疏 attend/decode
+#   （nvfp4 主链需 SM100 级 tcgen05/TMEM，SM120 无此硬件；见 SM120_fault_points.md）
+# 用法：docker compose -f /data/docker-compose-port.yml up -d
+# 停止：docker compose -f /data/docker-compose-port.yml down
+services:
+  minimax-m31:
+    image: docker.m.daocloud.io/vllm/vllm-openai:minimax-m31-sm120-port
+    container_name: minimax-m31
+    restart: unless-stopped
+    ipc: host
+    network_mode: host
+    environment:
+      - MAX_JOBS=12
+      - MINFER_FMHA_CACHE_DIR=/root/.cache/minfer
+      - TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions
+      # 降级逃生开关：置 1 则保留官方 nvfp4 行为（在 SM120 上会崩，仅供复现）
+      # - M3_SM120_KEEP_NVFP4=1
+    volumes:
+      - /data/MiniMax-M3.1-Flash:/data/MiniMax-M3.1-Flash
+      # JIT 编译缓存持久化，避免重启重复编译 sm120a kernel
+      - /data/vllm-cache/root-cache:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - /data/MiniMax-M3.1-Flash
+      - --max-model-len
+      - "524288"
+      - --tensor-parallel-size
+      - "4"
+      - --kv-cache-dtype
+      - fp8
+      - --attention-config
+      - '{"indexer_kv_dtype": "fp8", "use_prefill_query_quantization": true}'
+      - --compilation-config
+      - '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+      - --speculative-config
+      - '{"method":"dspark","num_speculative_tokens":7,"attention_backend":"FLASHINFER","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+      - --block-size
+      - "128"
+      - --disable-hybrid-kv-cache-manager
+      - --enable-auto-tool-choice
+      - --reasoning-parser
+      - minimax_m3
+      - --tool-call-parser
+      - minimax_m3
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --served-model-name
+      - MiniMax-M3.1-Flash

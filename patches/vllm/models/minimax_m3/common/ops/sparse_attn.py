@@ -1,0 +1,858 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Triton kernels for MiniMax M3 block-sparse GQA attention.
+
+The main heads attend only to the blocks selected by the lightning indexer (see
+``index_topk``). Adapted to vLLM's paged KV cache: the KV page size is forced to
+equal the sparse block size (128), so one selected block maps to exactly one
+page.
+
+Main K/V cache layout (vLLM):
+  ``(num_blocks, num_kv_heads, 128, 2 * head_dim)``
+  K=[..., :head_dim] V=[..., head_dim:]
+
+Only the paths MiniMax M3 uses are implemented: no attention sink, base-2
+(exp2/log2) softmax. The decode kernels use split-K (flash-decoding) over the
+selected blocks with a separate merge step, since one query token per request
+leaves the prefill kernels (which parallelize over the query dim) idle.
+"""
+
+import torch
+
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
+
+# One sparse block == one KV page.
+SPARSE_BLOCK_SIZE = 128
+
+_FP8_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+    torch.float8_e5m2fnuz,
+)
+
+# [m31-sm120-port] Packed NVFP4 page (vLLM layout): per KV head one slot of
+# ``128 * 64`` bytes of E2M1 codes -- 64 bytes per token, low nibble = even dim,
+# high nibble = odd dim -- followed by ``128 * 8`` bytes of E4M3 block scales,
+# one per 16 dims. Slot ``2 * h`` is head ``h``'s K, ``2 * h + 1`` its V. K
+# scales are ``pos * 8 + dim // 16``; V scales interleave four tokens at a
+# time: ``(pos // 4) * 32 + pos % 4 + 4 * (dim // 16)`` (matches the fmha
+# readers in ``third_party/fmha_sm100``). SM120 has no tcgen05, so the CUTLASS
+# Q8KV4 kernels cannot run; these Triton kernels dequantize on load instead.
+_NVFP4_CODE_BYTES = 128 * 64  # E2M1 plane inside one head slot (8192 B)
+_NVFP4_SCALE_BYTES = 128 * 8  # E4M3 block-scale plane (1024 B)
+
+
+@triton.jit
+def _e2m1_to_f16(codes):
+    """E2M1 4-bit code -> float16 by integer bit assembly (exact, table-free)."""
+    # Widen first: shifts on uint8 wrap at 8 bits.
+    c = codes.to(tl.int32)
+    mag = c & 7
+    bits = tl.where(
+        mag == 0,
+        0,
+        (((mag >> 1) + 14) << 10) | tl.where(mag > 1, (mag & 1) << 9, 0),
+    )
+    bits = (bits | ((c & 8) << 12)).to(tl.uint16)
+    return bits.to(tl.float16, bitcast=True)
+
+
+@triton.jit
+def _nvfp4_dequant_tile(
+    cache_ptr,
+    slot_base,
+    off_pos,
+    off_dim,
+    mask,
+    global_scale,
+    is_v: tl.constexpr,
+):
+    """Dequantize a 2D tile of one packed NVFP4 head slot.
+
+    ``off_pos`` / ``off_dim`` are the broadcast token / head-dim index tensors:
+    ``[D, N]`` for K and ``[N, D]`` for V. Returns ``code * block_scale *
+    global_scale`` in float32.
+    """
+    codes = tl.load(
+        cache_ptr + slot_base + off_pos * 64 + off_dim // 2, mask=mask, other=0
+    )
+    codes = (codes.to(tl.int32) >> ((off_dim & 1) * 4)) & 0xF
+    vals = _e2m1_to_f16(codes)
+    if is_v:
+        sf_off = (off_pos // 4) * 32 + off_pos % 4 + 4 * (off_dim // 16)
+    else:
+        sf_off = off_pos * 8 + off_dim // 16
+    sf = tl.load(
+        cache_ptr + slot_base + 8192 + sf_off, mask=mask, other=0  # E2M1 plane
+    )
+    sf = sf.to(tl.float8e4nv, bitcast=True).to(tl.float16)
+    return (vals * sf).to(tl.float32) * global_scale
+
+
+# ---------------------------------------------------------------------------
+# GQA block-sparse attention (paged). Main heads attend only to the selected
+# blocks. BLOCK_SIZE_K == 128 so each selected block is one page.
+# ---------------------------------------------------------------------------
+# since prefill metadata is sliced from mixed batch metadata, seq_lens and prefix_lens
+# might lose pointer alignment, which trigger Triton recompiles. we don't actually
+# need pointer alignment for those tensors anyway because we do scalar load.
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
+        * triton.next_power_of_2(args["gqa_group_size"]),
+    }
+)
+@triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
+def _gqa_sparse_fwd_kernel(
+    q_ptr,  # [total_q, num_heads, head_dim]
+    kv_cache_ptr,  # main cache: [num_blocks, num_kv_heads, 128, 2*head_dim]
+    k_scale_ptr,
+    v_scale_ptr,
+    t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+    o_ptr,  # [total_q, num_heads, head_dim]
+    block_table_ptr,  # [num_reqs, max_blocks]
+    cu_seqlens_q,
+    cu_seqblocks_q,
+    seq_lens,
+    prefix_lens,
+    num_kv_heads,
+    gqa_group_size,
+    head_dim,
+    max_topk,
+    num_q_loop,
+    sm_scale,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kv_blk,
+    stride_kv_h,
+    stride_kv_pos,
+    stride_kv_d,
+    stride_ks_h,
+    stride_ks_t,
+    stride_vs_h,
+    stride_vs_t,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_on,
+    stride_oh,
+    stride_od,
+    stride_bt_b,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_QH: tl.constexpr,
+    USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
+    KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
+    KV_NVFP4: tl.constexpr,  # packed NVFP4 head slots: E2M1 + E4M3 dequant
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_q = tl.program_id(0)
+    pid_kh = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    pid_h = pid_kh * gqa_group_size
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    q_block_start = tl.load(cu_seqblocks_q + pid_b)
+    q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
+    seq_len = tl.load(seq_lens + pid_b)
+    prefix_len = tl.load(prefix_lens + pid_b)
+    if pid_q * num_q_loop >= q_block_len:
+        return
+    real_q_loop = min(num_q_loop, q_block_len - pid_q * num_q_loop)
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    d_mask = off_d < head_dim
+    h_mask = off_h < gqa_group_size
+    for j in range(real_q_loop):
+        pid_q_j = pid_q * num_q_loop + j
+        t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
+        # Valid block count from seq position (no sentinel): block_size_q == 1.
+        q_abs = prefix_len + pid_q_j * BLOCK_SIZE_Q
+        valid_blocks = (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K
+        real_topk = tl.minimum(max_topk, valid_blocks)
+        off_qi = pid_q_j * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+        qo_mask = (
+            (off_qi < q_len)[:, None, None]
+            & h_mask[None, :, None]
+            & d_mask[None, None, :]
+        )
+        q = tl.load(
+            q_ptr
+            + (q_start + off_qi)[:, None, None] * stride_qn
+            + (pid_h + off_h)[None, :, None] * stride_qh
+            + off_d[None, None, :] * stride_qd,
+            mask=qo_mask,
+            other=0.0,
+        )
+        off_q = (
+            tl.arange(0, BLOCK_SIZE_Q)[:, None]
+            + pid_q_j * BLOCK_SIZE_Q
+            + prefix_len
+            - tl.arange(0, BLOCK_SIZE_K)[None, :]
+        )
+        m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
+        lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
+        acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
+        q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+        for _ in range(real_topk):
+            blk = tl.load(t_ptr_j).to(tl.int32)
+            t_ptr_j = t_ptr_j + stride_tk
+            c = blk * BLOCK_SIZE_K
+            page = tl.load(bt_row + blk).to(tl.int64)
+            pos = c + off_n
+            pos_mask = pos < seq_len
+            if KV_NVFP4:
+                k = _nvfp4_dequant_tile(
+                    kv_cache_ptr,
+                    page * stride_kv_blk + (2 * pid_kh) * stride_kv_h,
+                    off_n[None, :],
+                    off_d[:, None],
+                    d_mask[:, None] & pos_mask[None, :],
+                    tl.load(k_scale_ptr),
+                    is_v=False,
+                ).to(q.dtype)
+            else:
+                k = tl.load(
+                    kv_cache_ptr
+                    + page * stride_kv_blk
+                    + pid_kh * stride_kv_h
+                    + off_n[None, :] * stride_kv_pos
+                    + off_d[:, None] * stride_kv_d,
+                    mask=d_mask[:, None] & pos_mask[None, :],
+                    other=0.0,
+                )
+                if USE_FP8:
+                    k = k.to(q.dtype)
+                    if KV_SCALE_MODE == 1:
+                        k = (k * tl.load(k_scale_ptr)).to(q.dtype)
+                    elif KV_SCALE_MODE == 2:
+                        k_scale = tl.load(
+                            k_scale_ptr
+                            + pid_kh * stride_ks_h
+                            + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                            mask=pos_mask,
+                            other=1.0,
+                        )
+                        k = (k * k_scale[None, :]).to(q.dtype)
+            qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+            # causal: q_abs_pos - k_off >= block_start (c)
+            qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
+            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
+            qk += tl.dot(q, k) * sm_scale_log2e
+            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.exp2(qk - m_ij[:, None])
+            l_ij = tl.sum(p, axis=1)
+            acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+            if KV_NVFP4:
+                v = _nvfp4_dequant_tile(
+                    kv_cache_ptr,
+                    page * stride_kv_blk + (2 * pid_kh + 1) * stride_kv_h,
+                    off_n[:, None],
+                    off_d[None, :],
+                    pos_mask[:, None] & d_mask[None, :],
+                    tl.load(v_scale_ptr),
+                    is_v=True,
+                ).to(q.dtype)
+            else:
+                v = tl.load(
+                    kv_cache_ptr
+                    + page * stride_kv_blk
+                    + pid_kh * stride_kv_h
+                    + off_n[:, None] * stride_kv_pos
+                    + (head_dim + off_d[None, :]) * stride_kv_d,
+                    mask=pos_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                if USE_FP8:
+                    v = v.to(q.dtype)
+                    if KV_SCALE_MODE == 1:
+                        v = (v * tl.load(v_scale_ptr)).to(q.dtype)
+                    elif KV_SCALE_MODE == 2:
+                        v_scale = tl.load(
+                            v_scale_ptr
+                            + pid_kh * stride_vs_h
+                            + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
+                            mask=pos_mask,
+                            other=1.0,
+                        )
+                        v = (v * v_scale[:, None]).to(q.dtype)
+            acc_o += tl.dot(p.to(v.dtype), v)
+            m_i = m_ij
+            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
+        acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
+        tl.store(
+            o_ptr
+            + (q_start + off_qi)[:, None, None] * stride_on
+            + (pid_h + off_h)[None, :, None] * stride_oh
+            + off_d[None, None, :] * stride_od,
+            acc_o.to(o_ptr.dtype.element_ty),
+            mask=qo_mask,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Decode kernels (split-K). Decode batches are flattened request-major, with a
+# runtime query length used to map each query token back to its request metadata.
+# This parallelizes over the selected top-k blocks, producing partials that the
+# merge kernel combines (flash-decoding). All chunk counts depend only on shape
+# constants so the grid is fixed within a cuda graph. Base-2 (exp2/log2)
+# softmax matches the prefill kernel.
+# ---------------------------------------------------------------------------
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_H": lambda args: max(
+            16, triton.next_power_of_2(args["gqa_group_size"])
+        ),
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    }
+)
+@triton.jit(do_not_specialize=["decode_query_len"])
+def _gqa_sparse_decode_kernel(
+    q_ptr,  # [total_q, num_heads, head_dim]
+    kv_cache_ptr,  # main cache: [num_blocks, num_kv_heads, 128, 2*head_dim]
+    k_scale_ptr,
+    v_scale_ptr,
+    t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+    o_ptr,  # partial out: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
+    lse_ptr,  # partial lse (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
+    block_table_ptr,  # [num_reqs, max_blocks]
+    seq_lens,  # [num_reqs]
+    total_q,
+    gqa_group_size,
+    head_dim,
+    max_topk,
+    sm_scale,
+    decode_query_len,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_kv_blk,
+    stride_kv_h,
+    stride_kv_pos,
+    stride_kv_d,
+    stride_ks_h,
+    stride_ks_t,
+    stride_vs_h,
+    stride_vs_t,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_o_c,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    stride_l_c,
+    stride_l_b,
+    stride_l_h,
+    stride_bt_b,
+    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    NUM_TOPK_CHUNKS: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
+    KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
+    KV_NVFP4: tl.constexpr,  # packed NVFP4 head slots: E2M1 + E4M3 dequant
+    USE_PDL: tl.constexpr,
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    # split-K over the topk dimension: pid(0) folds (query-token, chunk).
+    pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
+    pid_b = pid_bc % total_q
+    pid_c = pid_bc // total_q
+    req_id = pid_b // decode_query_len
+    q_offset = pid_b - req_id * decode_query_len
+    pid_h = pid_kh * gqa_group_size
+    chunk_size_topk = (max_topk + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
+    chunk_start_topk = pid_c * chunk_size_topk
+    chunk_end_compiletime = chunk_start_topk + chunk_size_topk
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    seq_len = tl.load(seq_lens + req_id)
+    query_pos = seq_len - decode_query_len + q_offset
+    # Full-CG padding uses zero-length request rows. Clamp to an empty
+    # attention range instead of letting padded rows produce negative lengths.
+    kv_len = tl.maximum(query_pos + 1, 0)
+
+    # Upper bound on top-k entries from causal length; entries may be sentinels.
+    idx_base = t_ptr + pid_kh * stride_th + pid_b * stride_tn
+    num_blocks = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    real_topk = tl.minimum(max_topk, num_blocks)
+    chunk_end_topk = tl.minimum(chunk_end_compiletime, real_topk)
+
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    d_mask = off_d < head_dim
+    h_mask = off_h < gqa_group_size
+    hd_mask = h_mask[:, None] & d_mask[None, :]
+    bt_row = block_table_ptr + req_id * stride_bt_b
+
+    m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
+    q = tl.load(
+        q_ptr
+        + pid_b * stride_qn
+        + (pid_h + off_h)[:, None] * stride_qh
+        + off_d[None, :] * stride_qd,
+        mask=hd_mask,
+        other=0.0,
+    )
+
+    cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
+    for _ in tl.range(chunk_start_topk, chunk_end_topk):
+        blk = tl.load(cur_idx_ptr).to(tl.int32)
+        cur_idx_ptr = cur_idx_ptr + stride_tk
+        # topk_idx uses -1 for unused entries. Select a safe logical block
+        # before dereferencing the block table; invalid and future blocks then
+        # contribute a neutral online-softmax update without control flow.
+        valid_blk = (blk >= 0) & (blk < num_blocks)
+        safe_blk = tl.where(valid_blk, blk, 0)
+        c = safe_blk * BLOCK_SIZE_K
+        page = tl.load(bt_row + safe_blk).to(tl.int64)
+        pos = c + off_n
+        pos_mask = (pos < kv_len) & valid_blk
+        if KV_NVFP4:
+            k = _nvfp4_dequant_tile(
+                kv_cache_ptr,
+                page * stride_kv_blk + (2 * pid_kh) * stride_kv_h,
+                off_n[None, :],
+                off_d[:, None],
+                d_mask[:, None] & pos_mask[None, :],
+                tl.load(k_scale_ptr),
+                is_v=False,
+            ).to(q.dtype)
+        else:
+            k = tl.load(
+                kv_cache_ptr
+                + page * stride_kv_blk
+                + pid_kh * stride_kv_h
+                + off_n[None, :] * stride_kv_pos
+                + off_d[:, None] * stride_kv_d,
+                mask=d_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+            if USE_FP8:
+                k = k.to(q.dtype)
+                if KV_SCALE_MODE == 1:
+                    k = (k * tl.load(k_scale_ptr)).to(q.dtype)
+                elif KV_SCALE_MODE == 2:
+                    k_scale = tl.load(
+                        k_scale_ptr
+                        + pid_kh * stride_ks_h
+                        + (page * BLOCK_SIZE_K + off_n) * stride_ks_t,
+                        mask=pos_mask,
+                        other=1.0,
+                    )
+                    k = (k * k_scale[None, :]).to(q.dtype)
+        qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+        qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+        qk += tl.dot(q, k) * sm_scale_log2e
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        m_safe = tl.where(valid_blk, m_ij, 0.0)
+        p = tl.where(pos_mask[None, :], tl.exp2(qk - m_safe[:, None]), 0.0)
+        l_ij = tl.sum(p, axis=1)
+        alpha = tl.where(valid_blk, tl.exp2(m_i - m_safe), 1.0)
+        acc_o = acc_o * alpha[:, None]
+        if KV_NVFP4:
+            v = _nvfp4_dequant_tile(
+                kv_cache_ptr,
+                page * stride_kv_blk + (2 * pid_kh + 1) * stride_kv_h,
+                off_n[:, None],
+                off_d[None, :],
+                pos_mask[:, None] & d_mask[None, :],
+                tl.load(v_scale_ptr),
+                is_v=True,
+            ).to(q.dtype)
+        else:
+            v = tl.load(
+                kv_cache_ptr
+                + page * stride_kv_blk
+                + pid_kh * stride_kv_h
+                + off_n[:, None] * stride_kv_pos
+                + (head_dim + off_d[None, :]) * stride_kv_d,
+                mask=pos_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            if USE_FP8:
+                v = v.to(q.dtype)
+                if KV_SCALE_MODE == 1:
+                    v = (v * tl.load(v_scale_ptr)).to(q.dtype)
+                elif KV_SCALE_MODE == 2:
+                    v_scale = tl.load(
+                        v_scale_ptr
+                        + pid_kh * stride_vs_h
+                        + (page * BLOCK_SIZE_K + off_n) * stride_vs_t,
+                        mask=pos_mask,
+                        other=1.0,
+                    )
+                    v = (v * v_scale[:, None]).to(q.dtype)
+        acc_o += tl.dot(p.to(v.dtype), v)
+        lse_ij = m_safe + tl.log2(tl.exp2(lse_i - m_safe) + l_ij)
+        m_i = tl.where(valid_blk, m_safe, m_i)
+        lse_i = tl.where(valid_blk, lse_ij, lse_i)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # Empty chunks for active rows must store zero output; otherwise the merge
+    # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
+    scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
+    acc_o = acc_o * scale[:, None]
+    tl.store(
+        o_ptr
+        + pid_c * stride_o_c
+        + pid_b * stride_o_b
+        + (pid_h + off_h)[:, None] * stride_o_h
+        + off_d[None, :] * stride_o_d,
+        acc_o.to(o_ptr.dtype.element_ty),
+        mask=hd_mask,
+    )
+    tl.store(
+        lse_ptr
+        + pid_c * stride_l_c
+        + pid_b * stride_l_b
+        + (pid_h + off_h) * stride_l_h,
+        lse_i.to(lse_ptr.dtype.element_ty),
+        mask=h_mask,
+    )
+
+
+@triton.heuristics(
+    {"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])}
+)
+@triton.jit
+def _merge_topk_attn_out_kernel(
+    o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
+    lse_ptr,  # partials (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
+    out_ptr,  # merged out: [total_q, num_heads, head_dim]
+    head_dim,
+    stride_o_c,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    stride_l_c,
+    stride_l_b,
+    stride_l_h,
+    stride_out_n,
+    stride_out_h,
+    stride_out_d,
+    NUM_TOPK_CHUNKS: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    pid_b, pid_h = tl.program_id(0), tl.program_id(1)
+
+    # NOTE: assume seq_lens is safe to load before gdc_wait()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    off_c = tl.arange(0, NUM_TOPK_CHUNKS)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    d_mask = off_d < head_dim
+    o_ptrs = (
+        o_ptr
+        + pid_b * stride_o_b
+        + pid_h * stride_o_h
+        + off_c[:, None] * stride_o_c
+        + off_d[None, :] * stride_o_d
+    )
+    lse_ptrs = lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h + off_c * stride_l_c
+    o = tl.load(o_ptrs, mask=d_mask[None, :], other=0.0)
+    lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
+    lse_max = tl.max(lse, axis=0)
+    weights = tl.exp2(lse - lse_max)
+    weights = weights / tl.sum(weights, axis=0)
+    o_merged = tl.sum(o * weights[:, None], axis=0)
+    out_ptrs = (
+        out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
+    )
+    tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=d_mask)
+
+
+# ---------------------------------------------------------------------------
+# Python wrappers
+# ---------------------------------------------------------------------------
+_KV_SCALE_NONE = 0
+_KV_SCALE_SCALAR = 1
+_KV_SCALE_PER_TOKEN_HEAD = 2
+
+
+def _kv_scale_args(
+    output: torch.Tensor,
+    num_kv_heads: int,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int, int]:
+    if k_scale is None and v_scale is None:
+        return output, output, 0, 0, 0, 0, _KV_SCALE_NONE
+    if k_scale is None or v_scale is None:
+        raise ValueError("k_scale and v_scale must be both provided or both None")
+    if k_scale.device != output.device or v_scale.device != output.device:
+        raise ValueError("k_scale and v_scale must be on the same device as output")
+    if k_scale.numel() == 1 and v_scale.numel() == 1:
+        return k_scale, v_scale, 0, 0, 0, 0, _KV_SCALE_SCALAR
+    if k_scale.dim() == 2 and v_scale.dim() == 2:
+        if k_scale.shape[0] != num_kv_heads or v_scale.shape[0] != num_kv_heads:
+            raise ValueError(
+                "per-token/head KV scales must have shape "
+                f"[{num_kv_heads}, max_kv_tokens]"
+            )
+        if k_scale.shape != v_scale.shape:
+            raise ValueError("k_scale and v_scale must have matching shapes")
+        return (
+            k_scale,
+            v_scale,
+            k_scale.stride(0),
+            k_scale.stride(1),
+            v_scale.stride(0),
+            v_scale.stride(1),
+            _KV_SCALE_PER_TOKEN_HEAD,
+        )
+    raise ValueError(
+        "MiniMax-M3 sparse attention supports scalar KV scales or "
+        "[num_kv_heads, max_kv_tokens] per-token/head scales"
+    )
+
+
+@torch.no_grad()
+def minimax_m3_sparse_attn(
+    q: torch.Tensor,  # [total_q, num_heads, head_dim]
+    kv_cache: torch.Tensor,  # [num_blocks, num_kv_heads, 128, 2*head_dim]
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk]
+    block_table: torch.Tensor,  # [batch, max_blocks]
+    cu_seqlens_q: torch.Tensor,  # [batch+1] int32
+    seq_lens: torch.Tensor,  # [batch] int32
+    prefix_lens: torch.Tensor,  # [batch] int32
+    max_query_len: int,
+    num_kv_heads: int,
+    sm_scale: float,
+    output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """GQA block-sparse attention over the selected blocks. block_size_q == 1."""
+    total_q, num_heads, head_dim = q.shape
+    batch = cu_seqlens_q.shape[0] - 1
+    topk = topk_idx.shape[-1]
+    gqa_group_size = num_heads // num_kv_heads
+    use_nvfp4 = kv_cache.dtype == torch.uint8
+    use_fp8 = not use_nvfp4 and kv_cache.dtype in _FP8_DTYPES
+    if use_nvfp4:
+        # Packed head slots: K = slot 2*h, V = slot 2*h+1, stride(1) = 9216 B.
+        assert k_scale is not None and v_scale is not None, "nvfp4 needs global scales"
+        k_scale_arg, v_scale_arg = k_scale, v_scale
+        stride_ks_h = stride_ks_t = stride_vs_h = stride_vs_t = 0
+        kv_scale_mode = _KV_SCALE_NONE
+    else:
+        (
+            k_scale_arg,
+            v_scale_arg,
+            stride_ks_h,
+            stride_ks_t,
+            stride_vs_h,
+            stride_vs_t,
+            kv_scale_mode,
+        ) = (
+            _kv_scale_args(output, num_kv_heads, k_scale, v_scale)
+            if use_fp8
+            else (
+                output,
+                output,
+                0,
+                0,
+                0,
+                0,
+                _KV_SCALE_NONE,
+            )
+        )
+    grid = (max_query_len, num_kv_heads, batch)
+    _gqa_sparse_fwd_kernel[grid](
+        q,
+        kv_cache,
+        k_scale_arg,
+        v_scale_arg,
+        topk_idx,
+        output,
+        block_table,
+        cu_seqlens_q,
+        cu_seqlens_q,  # cu_seqblocks_q == cu_seqlens_q when block_size_q == 1
+        seq_lens,
+        prefix_lens,
+        num_kv_heads,
+        gqa_group_size,
+        head_dim,
+        topk,
+        1,  # num_q_loop
+        sm_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+        stride_ks_h,
+        stride_ks_t,
+        stride_vs_h,
+        stride_vs_t,
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        block_table.stride(0),
+        BLOCK_SIZE_Q=1,
+        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        USE_FP8=use_fp8,
+        KV_SCALE_MODE=kv_scale_mode,
+        KV_NVFP4=use_nvfp4,
+    )
+
+
+@torch.no_grad()
+def minimax_m3_sparse_attn_decode(
+    q: torch.Tensor,  # [total_q, num_heads, head_dim]
+    kv_cache: torch.Tensor,  # [num_blocks, num_kv_heads, 128, 2*head_dim]
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk]
+    block_table: torch.Tensor,  # [num_reqs, max_blocks]
+    seq_lens: torch.Tensor,  # [num_reqs] int32
+    num_kv_heads: int,
+    sm_scale: float,
+    output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    decode_query_len: int,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """GQA block-sparse attention for decode (split-K over the top-k blocks)."""
+    total_q, num_heads, head_dim = q.shape
+    assert total_q == seq_lens.shape[0] * decode_query_len
+    max_topk = topk_idx.shape[-1]
+    gqa_group_size = num_heads // num_kv_heads
+    use_nvfp4 = kv_cache.dtype == torch.uint8
+    use_fp8 = not use_nvfp4 and kv_cache.dtype in _FP8_DTYPES
+    if use_nvfp4:
+        assert k_scale is not None and v_scale is not None, "nvfp4 needs global scales"
+        k_scale_arg, v_scale_arg = k_scale, v_scale
+        stride_ks_h = stride_ks_t = stride_vs_h = stride_vs_t = 0
+        kv_scale_mode = _KV_SCALE_NONE
+    else:
+        (
+            k_scale_arg,
+            v_scale_arg,
+            stride_ks_h,
+            stride_ks_t,
+            stride_vs_h,
+            stride_vs_t,
+            kv_scale_mode,
+        ) = (
+            _kv_scale_args(output, num_kv_heads, k_scale, v_scale)
+            if use_fp8
+            else (
+                output,
+                output,
+                0,
+                0,
+                0,
+                0,
+                _KV_SCALE_NONE,
+            )
+        )
+    use_pdl = current_platform.is_arch_support_pdl()
+    # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
+    # SM9+); this ROCm Triton rejects it even when False ("Keyword argument
+    # launch_pdl was specified but unrecognised"). Only pass it when PDL is
+    # actually supported -- on ROCm use_pdl is always False, so it's omitted.
+    pdl_launch = {"launch_pdl": True} if use_pdl else {}
+    # split-K over the selected blocks; chunk count is shape-constant (cuda graph).
+    TARGET_GRID = 256
+    target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
+    num_topk_chunks = 1 << (target.bit_length() - 1)
+    o_partial = torch.empty(
+        num_topk_chunks, total_q, num_heads, head_dim, dtype=q.dtype, device=q.device
+    )
+    lse_partial = torch.empty(
+        num_topk_chunks, total_q, num_heads, dtype=torch.float32, device=q.device
+    )
+    grid = (total_q * num_topk_chunks, num_kv_heads)
+    _gqa_sparse_decode_kernel[grid](
+        q,
+        kv_cache,
+        k_scale_arg,
+        v_scale_arg,
+        topk_idx,
+        o_partial,
+        lse_partial,
+        block_table,
+        seq_lens,
+        total_q,
+        gqa_group_size,
+        head_dim,
+        max_topk,
+        sm_scale,
+        decode_query_len,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+        stride_ks_h,
+        stride_ks_t,
+        stride_vs_h,
+        stride_vs_t,
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        o_partial.stride(0),
+        o_partial.stride(1),
+        o_partial.stride(2),
+        o_partial.stride(3),
+        lse_partial.stride(0),
+        lse_partial.stride(1),
+        lse_partial.stride(2),
+        block_table.stride(0),
+        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        NUM_TOPK_CHUNKS=num_topk_chunks,
+        USE_FP8=use_fp8,
+        KV_SCALE_MODE=kv_scale_mode,
+        KV_NVFP4=use_nvfp4,
+        USE_PDL=use_pdl,
+        **pdl_launch,
+    )
+    merge_grid = (total_q, num_heads)
+    _merge_topk_attn_out_kernel[merge_grid](
+        o_partial,
+        lse_partial,
+        output,
+        head_dim,
+        o_partial.stride(0),
+        o_partial.stride(1),
+        o_partial.stride(2),
+        o_partial.stride(3),
+        lse_partial.stride(0),
+        lse_partial.stride(1),
+        lse_partial.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        NUM_TOPK_CHUNKS=num_topk_chunks,
+        USE_PDL=use_pdl,
+        **pdl_launch,
+    )

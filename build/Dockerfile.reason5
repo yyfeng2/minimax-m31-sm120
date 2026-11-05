@@ -1,0 +1,16 @@
+# m31-sm120-moe-native + 5-level reasoning_effort, baked in (no bind mounts).
+#
+# Production reads the template from the model directory
+# (/data/MiniMax-M3.1-Flash/chat_template.jinja, same md5 f90d3923...), because
+# that directory is bind-mounted and the serve command does NOT pass
+# --chat-template. The /opt/m31 copy is a spare: uncomment the flag in compose
+# to force this image's copy instead.
+#
+# No RUN step: this host has no docker bridge network, so BuildKit cannot
+# create the sandbox for RUN. Verification is done by build_reasoning_image.sh
+# after the build, inside a `docker run --network=none` container.
+FROM docker.m.daocloud.io/vllm/vllm-openai:minimax-m31-sm120-moe-native
+
+COPY chat_template.jinja /opt/m31/chat_template.jinja
+COPY minimax_m3_reasoning_parser.py \
+     /usr/local/lib/python3.12/dist-packages/vllm/reasoning/minimax_m3_reasoning_parser.py
